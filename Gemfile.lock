@@ -1,0 +1,33 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    anthropic (1.76.0)
+      base64 (~> 0.1)
+      connection_pool (>= 2, < 4)
+      standardwebhooks (~> 1.0)
+    base64 (0.3.0)
+    commonmarker (2.10.0-aarch64-linux)
+    commonmarker (2.10.0-aarch64-linux-musl)
+    commonmarker (2.10.0-arm-linux-gnu)
+    commonmarker (2.10.0-arm64-darwin)
+    commonmarker (2.10.0-x86_64-darwin)
+    commonmarker (2.10.0-x86_64-linux)
+    commonmarker (2.10.0-x86_64-linux-musl)
+    connection_pool (3.0.2)
+    standardwebhooks (1.1.0)
+
+PLATFORMS
+  aarch64-linux
+  aarch64-linux-musl
+  arm-linux-gnu
+  arm64-darwin
+  x86_64-darwin
+  x86_64-linux
+  x86_64-linux-musl
+
+DEPENDENCIES
+  anthropic (~> 1.76)
+  commonmarker (~> 2.10)
+
+BUNDLED WITH
+   2.6.9

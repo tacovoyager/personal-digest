@@ -1,0 +1,18 @@
+# Weekly news digest settings. Per-topic settings in topics/*.md override
+# lookback_days, max_searches, and max_fetches.
+
+recipient: you@example.com
+subject: "Weekly news digest — %{date}"
+
+model: claude-sonnet-5-5
+effort: medium          # low | medium | high | xhigh | max
+
+lookback_days: 7        # runs weekly, so cover the past week
+max_searches: 8         # web searches per topic ($10 per 1,000)
+max_fetches: 5          # full-article fetches per topic
+max_fetch_tokens: 8000  # cap on each fetched article; long pages drive most of the cost
+dedupe_weeks: 4         # don't repeat links sent in the last N weeks
+
+# Checked before any research runs, so a locked keyring fails fast instead of
+# paying for research that can't be emailed. Must match ~/.config/msmtp/config.
+keyring_lookup: [service, msmtp, host, smtp.gmail.com, user, you@example.com]

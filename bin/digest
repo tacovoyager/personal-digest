@@ -1,0 +1,321 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Researches each enabled topic in topics/*.md with Claude (web search + web
+# fetch), combines the results into one digest, and emails it via msmtp.
+#
+# Usage: bin/digest [--dry-run] [--topic SLUG] [--max-searches N] [--max-fetches N] [--max-fetch-tokens N]
+#   --dry-run     print the digest instead of emailing it; doesn't update state/
+#   --topic SLUG  run only topics/SLUG.md (even if it's disabled)
+#   --max-*       override config.yml / topic limits, e.g. for cheaper test runs
+
+require "bundler/setup"
+require "anthropic"
+require "commonmarker"
+require "date"
+require "json"
+require "optparse"
+require "securerandom"
+require "time"
+require "yaml"
+
+ROOT = File.expand_path("..", __dir__)
+MAX_CONTINUATIONS = 5
+# Claude Sonnet 5.5 list prices in USD per million tokens, plus per web search.
+# Used for the cost estimate only; a refusal fallback model may bill differently.
+PRICES = { input: 2.0, output: 10.0, cache_write: 2.50, cache_read: 0.20, search: 0.01 }.freeze
+
+Topic = Struct.new(:slug, :settings, :instructions)
+
+# Account-level API problems (no credits, bad login) that will fail every
+# topic, so the run stops instead of emailing a digest full of failures.
+class AccountError < StandardError; end
+
+def log(message) = $stderr.puts("#{Time.now.strftime('%F %T')} #{message}")
+
+def api_message(error)
+  body = error.respond_to?(:body) ? error.body : nil
+  (body.is_a?(Hash) && body.dig(:error, :message)) || error.message
+end
+
+def account_error?(error)
+  case error
+  when Anthropic::Errors::AuthenticationError, Anthropic::Errors::PermissionDeniedError then true
+  when Anthropic::Errors::BadRequestError then api_message(error).include?("credit balance")
+  else false
+  end
+end
+
+def load_topic(path)
+  match = File.read(path).match(/\A---\s*\n(.*?)\n---\s*\n(.*)\z/m)
+  raise "#{path}: missing YAML front matter" unless match
+
+  Topic.new(File.basename(path, ".md"), YAML.safe_load(match[1]) || {}, match[2].strip)
+end
+
+def select_topics(only)
+  if only
+    path = File.join(ROOT, "topics", "#{only}.md")
+    raise "no such topic: #{path}" unless File.exist?(path)
+
+    return [load_topic(path)]
+  end
+  Dir[File.join(ROOT, "topics", "[^_]*.md")].sort.map { load_topic(_1) }.select { _1.settings["enabled"] }
+end
+
+# --- dedupe state: links already sent per topic ---------------------------
+
+def state_path(slug) = File.join(ROOT, "state", "#{slug}.json")
+
+def recent_links(slug, weeks)
+  path = state_path(slug)
+  return [] unless File.exist?(path)
+
+  cutoff = Date.today - (weeks * 7)
+  JSON.parse(File.read(path)).select { Date.parse(_1["date"]) >= cutoff }
+end
+
+def remember_links(slug, markdown, weeks)
+  links = markdown.scan(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/).map do |title, url|
+    { "title" => title, "url" => url, "date" => Date.today.iso8601 }
+  end
+  entries = (recent_links(slug, weeks) + links).uniq { _1["url"] }
+  File.write(state_path(slug), JSON.pretty_generate(entries))
+end
+
+# --- research ---------------------------------------------------------------
+
+def system_prompt(guidelines)
+  <<~PROMPT
+    You research news and write one topic's section of a weekly email digest.
+
+    <guidelines>
+    #{guidelines}
+    </guidelines>
+
+    Output format:
+    - Markdown only. Start directly with the first story: no preamble, no topic heading, no closing remarks.
+    - For each story, a bold one-line headline, then a short paragraph.
+    - Link claims to their sources inline as [outlet name](url), using only URLs you actually retrieved.
+    - Order stories by importance.
+    - If nothing significant happened in the window, say so in one sentence rather than padding the section.
+  PROMPT
+end
+
+def user_prompt(topic, from, to, covered)
+  prompt = +<<~PROMPT
+    Topic: #{topic.settings['name'] || topic.slug}
+    Cover news published between #{from.iso8601} and #{to.iso8601} (today).
+
+    <topic_instructions>
+    #{topic.instructions}
+    </topic_instructions>
+  PROMPT
+  if covered.any?
+    prompt << "\nAlready covered in recent digests. Don't repeat these unless there's a material new development:\n"
+    covered.each { prompt << "- #{_1['title']}: #{_1['url']}\n" }
+  end
+  prompt
+end
+
+def web_tools(settings)
+  if settings["allowed_domains"] && settings["blocked_domains"]
+    raise "set allowed_domains or blocked_domains, not both"
+  end
+
+  filters = settings.slice("allowed_domains", "blocked_domains").transform_keys(&:to_sym)
+  [
+    { type: "web_search_20260209", name: "web_search", max_uses: settings["max_searches"], **filters },
+    { type: "web_fetch_20260209", name: "web_fetch", max_uses: settings["max_fetches"],
+      max_content_tokens: settings["max_fetch_tokens"], **filters }
+  ]
+end
+
+def add_usage(totals, usage)
+  totals[:input] += usage.input_tokens.to_i
+  totals[:output] += usage.output_tokens.to_i
+  totals[:cache_write] += usage.cache_creation_input_tokens.to_i
+  totals[:cache_read] += usage.cache_read_input_tokens.to_i
+  totals[:searches] += usage.server_tool_use&.web_search_requests.to_i
+end
+
+def cost(totals)
+  tokens = %i[input output cache_write cache_read].sum { totals[_1] * PRICES[_1] } / 1_000_000.0
+  tokens + (totals[:searches] * PRICES[:search])
+end
+
+# The answer is the text after the last tool call; earlier text is narration
+# between searches.
+def final_text(content)
+  last_tool = content.rindex { !%i[text thinking].include?(_1.type) } || -1
+  content[(last_tool + 1)..].select { _1.type == :text }.map(&:text).join.strip
+end
+
+def research(client, config, topic, guidelines, totals, overrides)
+  settings = config.merge(topic.settings, overrides)
+  to = Date.today
+  from = to - settings["lookback_days"]
+  covered = recent_links(topic.slug, config["dedupe_weeks"])
+  user = { role: "user", content: user_prompt(topic, from, to, covered) }
+  assistant_content = []
+
+  (MAX_CONTINUATIONS + 1).times do
+    messages = [user]
+    messages << { role: "assistant", content: assistant_content } if assistant_content.any?
+    response = client.beta.messages.create(
+      model: config["model"].to_sym,
+      max_tokens: 16_000,
+      output_config: { effort: config["effort"] },
+      system_: system_prompt(guidelines),
+      tools: web_tools(settings),
+      messages: messages,
+      fallbacks: :default,
+      betas: ["server-side-fallback-2026-07-01"],
+      request_options: { timeout: 600 }
+    )
+    add_usage(totals, response.usage)
+
+    case response.stop_reason
+    when :pause_turn
+      # The server-side search loop hit its iteration limit; resend so it resumes.
+      assistant_content += response.content
+    when :refusal
+      raise "Claude declined this topic (#{response.stop_details&.category || 'no category'})"
+    when :max_tokens
+      raise "response hit the max_tokens limit before finishing"
+    else
+      text = final_text(response.content)
+      raise "empty response" if text.empty?
+
+      return text
+    end
+  end
+  raise "research didn't finish after #{MAX_CONTINUATIONS} continuations"
+end
+
+# --- email ------------------------------------------------------------------
+
+def keyring_unlocked?(lookup)
+  system("secret-tool", "lookup", *lookup, out: File::NULL, err: File::NULL)
+end
+
+def html_document(markdown)
+  body = Commonmarker.to_html(markdown, options: { extension: { autolink: true } })
+  <<~HTML
+    <!DOCTYPE html>
+    <html><head><meta charset="utf-8"></head>
+    <body style="font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; max-width: 720px; margin: auto; line-height: 1.5; color: #222;">
+    #{body}
+    </body></html>
+  HTML
+end
+
+def build_email(recipient, subject, markdown)
+  boundary = "digest-#{SecureRandom.hex(8)}"
+  <<~MAIL
+    To: #{recipient}
+    Subject: =?UTF-8?B?#{[subject].pack('m0')}?=
+    Date: #{Time.now.rfc2822}
+    MIME-Version: 1.0
+    Content-Type: multipart/alternative; boundary="#{boundary}"
+
+    --#{boundary}
+    Content-Type: text/plain; charset=UTF-8
+    Content-Transfer-Encoding: base64
+
+    #{[markdown].pack('m')}
+    --#{boundary}
+    Content-Type: text/html; charset=UTF-8
+    Content-Transfer-Encoding: base64
+
+    #{[html_document(markdown)].pack('m')}
+    --#{boundary}--
+  MAIL
+end
+
+def send_email(recipient, mail)
+  IO.popen(["msmtp", recipient], "w") { _1.write(mail) }
+  raise "msmtp failed (exit #{$?.exitstatus}); see ~/.local/state/msmtp.log" unless $?.success?
+end
+
+# --- main -------------------------------------------------------------------
+
+options = { dry_run: false, topic: nil }
+OptionParser.new do |opts|
+  opts.banner = "Usage: bin/digest [--dry-run] [--topic SLUG]"
+  opts.on("--dry-run", "Print the digest instead of emailing it") { options[:dry_run] = true }
+  opts.on("--topic SLUG", "Run only topics/SLUG.md") { options[:topic] = _1 }
+  opts.on("--max-searches N", Integer, "Override searches per topic") { options["max_searches"] = _1 }
+  opts.on("--max-fetches N", Integer, "Override article fetches per topic") { options["max_fetches"] = _1 }
+  opts.on("--max-fetch-tokens N", Integer, "Override tokens per fetched article") { options["max_fetch_tokens"] = _1 }
+end.parse!
+
+config_path = File.join(ROOT, "config.yml")
+abort "missing config.yml; copy config.example.yml to config.yml and edit it" unless File.exist?(config_path)
+
+Dir.mkdir(File.join(ROOT, "state")) unless Dir.exist?(File.join(ROOT, "state"))
+lock = File.open(File.join(ROOT, "state", ".lock"), File::CREAT | File::RDWR)
+abort "another digest run is in progress" unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+
+config = YAML.safe_load_file(config_path)
+recipient = config["recipient"]
+
+begin
+  topics = select_topics(options[:topic])
+  raise "no enabled topics in topics/" if topics.empty?
+  # Fail before paying for research that couldn't be emailed.
+  if !options[:dry_run] && !keyring_unlocked?(config["keyring_lookup"])
+    raise "keyring is locked or unreachable; log in to the desktop session"
+  end
+
+  guidelines = File.read(File.join(ROOT, "guidelines.md")).gsub(/<!--.*?-->/m, "").strip
+  client = Anthropic::Client.new
+  totals = Hash.new(0)
+  succeeded = {}
+  sections = topics.map do |topic|
+    name = topic.settings["name"] || topic.slug
+    log "researching #{name}"
+    text = research(client, config, topic, guidelines, totals, options.slice("max_searches", "max_fetches", "max_fetch_tokens"))
+    succeeded[topic] = text
+    "## #{name}\n\n#{text}"
+  rescue StandardError => e
+    raise AccountError, api_message(e) if account_error?(e)
+
+    log "#{name} failed: #{e.class}: #{api_message(e)}"
+    "## #{name}\n\n_Research for this topic failed: #{api_message(e)}_"
+  end
+
+  today = Date.today
+  from = today - config["lookback_days"]
+  footer = "_#{succeeded.size}/#{topics.size} topics · #{totals[:searches]} searches · " \
+           "#{totals[:input] + totals[:cache_read] + totals[:cache_write]} input / #{totals[:output]} output tokens · " \
+           "≈ $#{format('%.2f', cost(totals))} estimated API cost_"
+  digest = "# Weekly news digest\n\n_#{from.strftime('%b %-d')} – #{today.strftime('%b %-d, %Y')}_\n\n" \
+           "#{sections.join("\n\n---\n\n")}\n\n---\n\n#{footer}\n"
+  log footer.delete("_")
+
+  if options[:dry_run]
+    puts digest
+  else
+    subject = format(config["subject"], date: today.strftime("%b %-d, %Y"))
+    send_email(recipient, build_email(recipient, subject, digest))
+    succeeded.each { |topic, text| remember_links(topic.slug, text, config["dedupe_weeks"]) }
+    log "digest sent to #{recipient}"
+  end
+rescue StandardError => e
+  log "run failed: #{e.class}: #{e.message}"
+  unless options[:dry_run]
+    body = "The weekly news digest run failed:\n\n    #{e.message}\n"
+    if e.is_a?(AccountError)
+      body += "\nThis is an Anthropic account problem, such as an empty credit balance. Fix it in the " \
+              "Claude Console (Plans & Billing), then rerun:\n\n" \
+              "    cd #{ROOT} && mise exec -- bin/digest\n"
+    end
+    begin
+      send_email(recipient, build_email(recipient, "News digest failed", body))
+    rescue StandardError => mail_error
+      log "couldn't send failure email either: #{mail_error.message}"
+    end
+  end
+  exit 1
+end
